@@ -2,9 +2,9 @@ import requests
 import json
 import time
 import logging
-from telegram import Bot
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import os
-import schedule
 import hashlib
 import asyncio
 from dotenv import load_dotenv
@@ -13,154 +13,153 @@ from googleapiclient.discovery import build
 
 load_dotenv()
 
-# TOKEN = os.getenv('TELEGRAM_BOT_TOKEN ')
 TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
-CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
 API_KEY = os.environ['CF_API_KEY']
 API_SECRET = os.environ['CF_API_SECRET']
-SHEET_ID = None
 
-bot = Bot(token=TOKEN)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-HANDLE = None
+# Dictionary to store user sessions
+user_sessions = {}
 
-#Function to take handle from user using the telegram bot
-async def take_handle():
-    # Fetch the latest update to get the current highest update_id
-    updates = await bot.get_updates()
-    last_update_id = updates[-1].update_id if updates else 0
-
-    # Send the message to the user asking for the handle
-    await bot.send_message(chat_id=CHAT_ID, text="Enter the codeforces handle for which you want to get the recent submissions")
-
-    # Continuously check for a new message with a higher update_id
-    while True:
-        updates = await bot.get_updates(offset=last_update_id + 1)  # Fetch only new updates
-        if updates:
-            handle = updates[-1].message.text
-            return handle
-        await asyncio.sleep(1)  # Wait a bit before checking for updates again to avoid spamming the API
-
-#Function to take handle from user using the sheet_id
-async def take_sheet_id():
-    # Fetch the latest update to get the current highest update_id
-    updates = await bot.get_updates()
-    last_update_id = updates[-1].update_id if updates else 0
-
-    # Send the message to the user asking for the handle
-    await bot.send_message(chat_id=CHAT_ID, text="First give this email:\nparth-testing-account@cf-submission-bot.iam.gserviceaccount.com\n access as editor to your google sheet document.\nEnter the your google sheet id(which is present in the url bteeween d/ and /edit)")
-
-    # Continuously check for a new message with a higher update_id
-    while True:
-        updates = await bot.get_updates(offset=last_update_id + 1)  # Fetch only new updates
-        if updates:
-            sheet_id = updates[-1].message.text
-            return sheet_id
-        await asyncio.sleep(1)  # Wait a bit before checking for updates again to avoid spamming the API
-
-
-#Function to generate the api signature
 def generate_api_sig(method_name, params, secret):
-    rand = 'abcdef'  # This can be any random 6 characters
+    rand = 'abcdef'
     sorted_params = '&'.join([f'{k}={v}' for k, v in sorted(params.items())])
     string_to_hash = f'{rand}/{method_name}?{sorted_params}#{secret}'
     sha512_hash = hashlib.sha512(string_to_hash.encode()).hexdigest()
     return f'{rand}{sha512_hash}'
 
-#Function to get the recent submissions
-def get_cf_data(handle):
+def get_cf_data(handle, count='10'):
     method_name = 'user.status'
     params = {
         'apiKey': API_KEY,
-        'handle' : handle ,
+        'handle': handle,
         'time': str(int(time.time())),
-        'count': '5'
+        'count': count
     }
     apiSig = generate_api_sig(method_name, params, API_SECRET)
     url = f"https://codeforces.com/api/{method_name}?{'&'.join([f'{k}={v}' for k, v in params.items()])}&apiSig={apiSig}"
-    print("url ==",url)
     response = requests.get(url)
     data = response.json()
-    # print("Hello bhau")
-    if data.get('result'):
-        return data
+    return data if data.get('result') else None
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    await update.message.reply_text("Welcome! Please enter your Codeforces handle.")
+    user_sessions[user_id] = {'state': 'waiting_for_handle'}
+    
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id in user_sessions:
+        del user_sessions[user_id]
+        await update.message.reply_text("Monitoring stopped. Use /start to begin again.")
     else:
-        return None
+        await update.message.reply_text("You're not currently monitoring any submissions.")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    message_text = update.message.text
+
+    if user_id not in user_sessions:
+        await update.message.reply_text("Please start the bot with /start command.")
+        return
+
+    state = user_sessions[user_id]['state']
+
+    if state == 'waiting_for_handle':
+        user_sessions[user_id]['handle'] = message_text
+        user_sessions[user_id]['state'] = 'waiting_for_sheet_id'
+        await update.message.reply_text("First give this email:\nparth-testing-account@cf-submission-bot.iam.gserviceaccount.com\n access as editor to your google sheet document.\nEnter the your google sheet id(which is present in the url bteeween d/ and /edit).")
     
+    elif state == 'waiting_for_sheet_id':
+        user_sessions[user_id]['sheet_id'] = message_text
+        user_sessions[user_id]['state'] = 'initializing'
+        await update.message.reply_text("Setup complete! Initializing submission tracking...")
+        asyncio.create_task(initialize_submission_tracking(update, context))
     
-def get_cf_data2(handle):
-    method_name = 'user.status'
-    params = {
-        'apiKey': API_KEY,
-        'handle' : handle ,
-        'time': str(int(time.time())),
-        'count': '1'
-    }
-    apiSig = generate_api_sig(method_name, params, API_SECRET)
-    url = f"https://codeforces.com/api/{method_name}?{'&'.join([f'{k}={v}' for k, v in params.items()])}&apiSig={apiSig}"
-    print("url ==",url)
-    response = requests.get(url)
-    data = response.json()
-    # print(str(data))
-    if data.get('result'):
-        return data
     else:
-        return None
-# Store the initial submission id
-initial_submission_id = None
+        await update.message.reply_text("I'm already monitoring submissions. Use /stop to stop monitoring.")
 
-
-async def check_for_new_submissions(a):
-    global initial_submission_id
-    if(a==0):
-        response = get_cf_data2(HANDLE)
+async def initialize_submission_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    handle = user_sessions[user_id]['handle']
+    
+    # Get the most recent submission
+    response = get_cf_data(handle, count='1')
+    if response and response['status'] == 'OK' and response['result']:
+        initial_submission_id = response['result'][0]['id']
+        user_sessions[user_id]['initial_submission_id'] = initial_submission_id
+        user_sessions[user_id]['state'] = 'ready'
+        await update.message.reply_text("Initialization complete. Now monitoring for new submissions.")
+        asyncio.create_task(monitor_submissions(update, context))
     else:
-        response = get_cf_data(HANDLE)
-    
-    if response is None or response['status'] != 'OK':
-        logging.error("No new submissions found or an error occurred.")
-        return None
-    new_submission = response['result']  # Access the list of submissions
-    needed_submission = []
-    new_submission_id = None
-    flag = 0
-    for submission in new_submission:
-        print("Submission_id ==  ,initial_submission_id = ",submission['id'] , initial_submission_id)
-        if submission['id'] == initial_submission_id :  # Check if the submission is the same as the last one
-            break
-        else:
-            if(flag == 0):
-                new_submission_id = submission['id']
-                flag = 1
-            needed_submission.append(submission)
-    if(new_submission_id == None):
-            return None
-    initial_submission_id = new_submission_id
-    return needed_submission  # Return a list containing the new submission
-    
+        await update.message.reply_text("Failed to initialize. Please try /start again.")
+        del user_sessions[user_id]
 
+async def monitor_submissions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    handle = user_sessions[user_id]['handle']
+    sheet_id = user_sessions[user_id]['sheet_id']
+    last_submission_id = user_sessions[user_id]['initial_submission_id']
 
-# Function to send the new submission to the telegram chat
-def send_new_submission(new_submission):
+    while user_id in user_sessions and user_sessions[user_id]['state'] == 'ready':
+        new_submissions = await check_for_new_submissions(handle, last_submission_id)
+        if new_submissions:
+            last_submission_id = new_submissions[0]['id']
+            messages = send_new_submission(new_submissions, handle)
+            for message in messages:
+                await update.message.reply_text(message)
+            append_to_google_sheet(new_submissions, handle, sheet_id)
+        await asyncio.sleep(10)
+
+async def check_for_new_submissions(handle, last_submission_id):
+    response = get_cf_data(handle)
+    if response and response['status'] == 'OK':
+        submissions = response['result']
+        new_submissions = []
+        for submission in submissions:
+            if submission['id'] == last_submission_id:
+                break
+            new_submissions.append(submission)
+        return list(reversed(new_submissions))  # Reverse to get chronological order
+    return None
+
+def send_new_submission(submissions, handle):
     messages = []
-    if new_submission:
-        for submission in new_submission:
-            verdict = submission['verdict']
-            problem = submission['problem']
-            problem_name = problem['name']
-            problem_rating = problem.get('rating', 'Not Available')
-            problem_tags = problem['tags']
-            message = f"New submission by {HANDLE} \nON Problem: [{problem_name}] \nRated : [{problem_rating}]  \nWith Tags : [{problem_tags}] \nwith verdict: {verdict}\n\n"
-            messages.append(message)  
-        return messages
+    for submission in submissions:
+        verdict = submission['verdict']
+        problem = submission['problem']
+        problem_name = problem['name']
+        problem_rating = problem.get('rating', 'Not Available')
+        problem_tags = problem['tags']
+        message = f"New submission by {handle}\nProblem: {problem_name}\nRated: {problem_rating}\nTags: {problem_tags}\nVerdict: {verdict}\n"
+        messages.append(message)
+    return messages
 
-def append_to_google_sheet(submissions):
-    creds = Credentials.from_service_account_file('/home/parthtokekar/Desktop/dada_help/codeforces_track_submissions/telegram-bot/cf_submission_bot.json')
+def append_to_google_sheet(submissions, handle, sheet_id):
+    # Implementation remains the same as before
+    # Make sure to use the sheet_id from the user's session
+    service_account_info = {
+    "type": os.environ["GOOGLE_TYPE"],
+    "project_id": os.environ["GOOGLE_PROJECT_ID"],
+    "private_key_id": os.environ["GOOGLE_PRIVATE_KEY_ID"],
+    "private_key": os.environ["GOOGLE_PRIVATE_KEY"].replace('\\n', '\n'),
+    "client_email": os.environ["GOOGLE_CLIENT_EMAIL"],
+    "client_id": os.environ["GOOGLE_CLIENT_ID"],
+    "auth_uri": os.environ["GOOGLE_AUTH_URI"],
+    "token_uri": os.environ["GOOGLE_TOKEN_URI"],
+    "auth_provider_x509_cert_url": os.environ["GOOGLE_AUTH_PROVIDER_X509_CERT_URL"],
+    "client_x509_cert_url": os.environ["GOOGLE_CLIENT_X509_CERT_URL"],
+    "universe_domain": os.environ["GOOGLE_UNIVERSE_DOMAIN"]
+    }
+
+    creds = Credentials.from_service_account_info(service_account_info)
     service = build('sheets', 'v4', credentials=creds)
     sheet = service.spreadsheets()
 
     # Read existing data from the sheet
-    result = sheet.values().get(spreadsheetId=SHEET_ID, range='Sheet1!A2:F').execute()
+    result = sheet.values().get(spreadsheetId=sheet_id, range='Sheet1!A2:F').execute()
     existing_values = result.get('values', [])
 
     # Prepare new submission data
@@ -171,69 +170,39 @@ def append_to_google_sheet(submissions):
         problem_name = problem['name']
         problem_rating = problem.get('rating', 'Not Available')
         problem_tags = ", ".join(problem['tags'])
-        row = [HANDLE, problem_name, problem_rating, problem_tags, verdict, time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(submission['creationTimeSeconds']))]
+        row = [handle, problem_name, problem_rating, problem_tags, verdict, time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(submission['creationTimeSeconds']))]
         new_values.append(row)
 
     # Filter out rows with the same problem name and verdict other than "OK"
     problem_names = {row[1] for row in new_values}
-    filtered_values = [row for row in existing_values if row[1] not in problem_names or row[4] == 'OK']
+    filtered_values = [row for row in existing_values if row[1] not in problem_names or row[4] == 'OK' and verdict != 'OK']
 
     # Combine filtered existing data with new data
     combined_values = filtered_values + new_values
 
     # Clear the existing data
-    sheet.values().clear(spreadsheetId=SHEET_ID, range='Sheet1!A2:F').execute()
+    sheet.values().clear(spreadsheetId=sheet_id, range='Sheet1!A2:F').execute()
 
     # Append combined data
     body = {'values': combined_values}
     result = sheet.values().append(
-        spreadsheetId=SHEET_ID,
+        spreadsheetId=sheet_id,
         range='Sheet1!A2',
         valueInputOption='RAW',
         insertDataOption='INSERT_ROWS',
         body=body
     ).execute()
     print('{0} cells appended.'.format(result.get('updates').get('updatedCells')))
+    pass
 
+def main() -> None:
+    application = Application.builder().token(TOKEN).build()
 
-async def main():
-    global HANDLE
-    try:
-        # Wait for up to 60 seconds for a handle to be provided
-        HANDLE = await asyncio.wait_for(take_handle(), timeout=120)
-    except asyncio.TimeoutError:
-        print("No handle provided within 2 minute. Exiting...")
-        return  # Exit the function, which ends the program
-    
-    
-    global SHEET_ID
-    try:
-        # Wait for up to 60 seconds for a handle to be provided
-        SHEET_ID = await asyncio.wait_for(take_sheet_id(), timeout=600)
-    except asyncio.TimeoutError:
-        print("No handle provided within 10 minute. Exiting...")
-        return  # Exit the function, which ends the program
-    
-    
-    a = 0
-    while True:
-        new_submission = await check_for_new_submissions(a)
-        a = 1
-       # print("New Submission == ", new_submission)
-        if new_submission is not None:
-            messages = (send_new_submission(new_submission))
-            for message in messages:
-                await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
-            append_to_google_sheet(new_submission)
-        else:
-            print("No new submission to send.")
-        await asyncio.sleep(10)  # Wait for 10 seconds before checking again
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stop", stop))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
-    asyncio.run(main())
-
-
-
-
-
-
+    main()

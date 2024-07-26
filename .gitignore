@@ -1,0 +1,6 @@
+# Ignore env files
+
+*.env.local
+.env.local
+.env*
+cf_submission_*
